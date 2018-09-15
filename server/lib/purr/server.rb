@@ -1,3 +1,4 @@
+require 'socket'
 require 'surro-gate'
 
 module Purr
@@ -15,6 +16,19 @@ module Purr
 
       @remote = block
       @proxy = SurroGate.new
+
+      Thread.new do
+        @proxy.select(1000)
+
+        @proxy.each_ready do |left, right|
+          begin
+            right.write_nonblock(left.read_nonblock(4096))
+          rescue => ex
+            logger(env, :info, "Connection #{left} <-> #{right} closed due to #{ex}")
+            proxy.cleanup(left, right)
+          end
+        end
+      end
     end
 
     # Method required by the Rack API
@@ -39,6 +53,7 @@ module Purr
       # Open the remote TCP socket
       sock = TCPSocket.new(host, port)
 
+
       # Start proxying
       @proxy.push(http, sock)
       logger(env, :info, "Redirecting incoming request from #{env['REMOTE_ADDR']} to [#{host}]:#{port}")
@@ -47,11 +62,8 @@ module Purr
       return [200, {}, []]
     rescue => ex
       logger(env, :error, "#{ex.class} happened for #{env['REMOTE_ADDR']} trying to access #{host}:#{port}")
-      # Clean up the opened sockets if available
-      http.close unless http.nil? || http.closed?
-      sock.close unless sock.nil? || sock.closed?
-      # Return with a 404 error
-      return not_found
+      cleanup(http, sock)
+      return not_found # Return with a 404 error
     end
 
     private
@@ -82,6 +94,14 @@ module Purr
 
     def not_found
       [404, { 'Content-Type' => 'text/plain' }, ['Not found!']]
+    end
+
+    def cleanup(*sockets)
+      # Omit `nil`s from the array
+      sockets.compact!
+      # Close the opened sockets and remove them from the proxy
+      sockets.each { |sock| sock.close unless sock.closed? }
+      @proxy.pop(sockets)
     end
 
     def logger(env, level, message)
